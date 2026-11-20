@@ -7,10 +7,10 @@ import {
   buildCommit,
   buildTreeFromFlat,
   collectReachable,
+  commitInfo,
   flattenTree,
   isAncestor,
   mergeBase,
-  parseCommit,
   peelToCommit,
 } from './gitobj.ts';
 
@@ -115,9 +115,7 @@ export class Repo {
   tipTreeSha(branch: string): string | null {
     const tip = this.branchTip(branch);
     if (tip === null) return null;
-    const commit = this.store.get(tip);
-    if (commit === undefined || commit.type !== 'commit') return null;
-    return parseCommit(commit.data).tree;
+    return commitInfo(this.store, tip)?.tree ?? null;
   }
 
   /** The flat path -> blob sha map at a branch tip (empty when unborn). */
@@ -128,9 +126,9 @@ export class Repo {
 
   /** The flat map at an arbitrary commit sha. */
   flatAtCommit(commitSha: string): Map<string, string> {
-    const object = this.store.get(commitSha);
-    if (object === undefined || object.type !== 'commit') return new Map();
-    return flattenTree(this.store, parseCommit(object.data).tree);
+    const info = commitInfo(this.store, commitSha);
+    if (info === null) return new Map();
+    return flattenTree(this.store, info.tree);
   }
 
   /**
@@ -407,7 +405,7 @@ export function listCommits(repo: Repo, tip: string): string[] {
     if (object === undefined || object.type !== 'commit') continue;
     seen.add(sha);
     order.push(sha);
-    const parents = parseCommit(object.data).parents;
+    const parents = commitInfo(repo.store, sha)?.parents ?? [];
     for (let i = parents.length - 1; i >= 0; i -= 1) stack.push(parents[i]);
   }
   return order;

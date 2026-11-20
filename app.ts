@@ -84,8 +84,12 @@ async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Prom
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  const pathname = url.pathname;
+  // The path is all routing needs; the parsed URL is built only for the REST branch,
+  // whose handlers read query parameters. Slicing at '?' matches the URL parser's
+  // pathname for the origin-form request targets the suite sends.
+  const rawUrl = req.url ?? '/';
+  const queryAt = rawUrl.indexOf('?');
+  const pathname = queryAt === -1 ? rawUrl : rawUrl.slice(0, queryAt);
   const method = req.method ?? 'GET';
 
   // The env's boot probe: no token, called twice.
@@ -120,11 +124,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   // REST v3.
   if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+    const url = new URL(rawUrl, 'http://entry');
     const segments = pathname
       .replace(/^\/api\/v3\/?/, '')
       .split('/')
       .filter((segment) => segment !== '')
-      .map((segment) => decodeURIComponent(segment));
+      .map((segment) => (segment.includes('%') ? decodeURIComponent(segment) : segment));
     const isPublicRoot = segments.length === 0 || (segments.length === 1 && segments[0] === 'meta');
     if (!isPublicRoot && !authorized(req)) {
       unauthorized(res);

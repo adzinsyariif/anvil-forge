@@ -6,8 +6,8 @@ import {
   ZERO_OID,
   collectReachable,
   commitAncestors,
+  commitInfo,
   isAncestor,
-  parseCommit,
   peelOne,
   peelToCommit,
   readPack,
@@ -124,21 +124,23 @@ export function readBody(req: IncomingMessage, maxBytes = 128 * 1024 * 1024): Pr
 
 // --------------------------------------------------------------------------- info/refs
 
+/** The v2 upload-pack advertisement names no repository state, so it is built once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, service: string): void {
   const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
   const preamble = pktLine(`# service=${service}\n`);
   if (service === 'git-upload-pack' && isV2) {
-    const lines: Buffer[] = [
-      preamble,
-      PKT_FLUSH,
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ];
-    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', Buffer.concat(lines));
+    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     return;
   }
   const caps =
@@ -238,11 +240,11 @@ function planFetch(repo: Repo, request: FetchRequest): { objects: string[]; shal
     for (let level = 1; level <= depth; level += 1) {
       const next: string[] = [];
       for (const sha of frontier) {
-        const object = store.get(sha);
-        if (object === undefined || object.type !== 'commit') continue;
+        const info = commitInfo(store, sha);
+        if (info === null) continue;
         if (includedCommits.has(sha)) continue;
         includedCommits.add(sha);
-        const parents = parseCommit(object.data).parents;
+        const parents = info.parents;
         if (level === depth) {
           if (parents.length > 0) boundary.add(sha);
         } else {
@@ -286,6 +288,45 @@ function planFetch(repo: Repo, request: FetchRequest): { objects: string[]; shal
   };
   objects.sort((a, b) => rank(a) - rank(b));
   return { objects, shallowLines };
+}
+
+// --------------------------------------------------------------------------- fetch response cache
+
+/**
+ * A fetch answer is a pure function of the request and the object graph: objects are
+ * content-addressed and immutable, and the closure reachable from a commit is fixed by its
+ * hash, so an answer built while every want exists stays correct for that request. The
+ * clone workload asks for the same depth-1 pack fifty times in parallel; building it once
+ * serves them all. The cache is per repository object, so a deleted repository takes its
+ * answers with it, and it is cleared rather than grown past FETCH_CACHE_MAX entries.
+ */
+const fetchResponses = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchKey(variant: string, request: FetchRequest, sideband: boolean): string {
+  return [
+    variant,
+    sideband ? 'sb' : 'raw',
+    `w=${request.wants.join(',')}`,
+    `h=${request.haves.join(',')}`,
+    `s=${request.shallow.join(',')}`,
+    `d=${request.depth ?? ''}`,
+    `e=${request.deepen ?? ''}`,
+  ].join('|');
+}
+
+function cachedFetch(repo: Repo, key: string, build: () => Buffer): Buffer {
+  let cache = fetchResponses.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    fetchResponses.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (cache.size >= FETCH_CACHE_MAX) cache.clear();
+  cache.set(key, built);
+  return built;
 }
 
 function packResponse(repo: Repo, request: FetchRequest, sideband: boolean): Buffer {
@@ -358,7 +399,10 @@ export async function handleUploadPackV2(req: IncomingMessage, res: ServerRespon
       sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(out));
       return;
     }
-    sendBuffer(res, 200, 'application/x-git-upload-pack-result', packResponse(repo, request, true));
+    const body = request.wants.every((want) => repo.store.has(want))
+      ? cachedFetch(repo, fetchKey('v2', request, true), () => packResponse(repo, request, true))
+      : packResponse(repo, request, true);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', body);
     return;
   }
   sendBuffer(res, 200, 'application/x-git-upload-pack-result', PKT_FLUSH);
@@ -385,24 +429,28 @@ export async function handleUploadPackV0(req: IncomingMessage, res: ServerRespon
       request.deepen = request.depth;
     } else if (text === 'done') request.done = true;
   }
-  const { objects, shallowLines } = planFetch(repo, request);
-  const pack = writePack(repo.store, objects);
-  const out: Buffer[] = [];
-  for (const line of shallowLines) {
-    const [kind, sha] = line.split(' ');
-    out.push(pktLine(`${kind} ${sha}\n`));
-  }
-  out.push(pktLine('NAK\n'));
-  if (sideband) {
-    const CHUNK = 32768;
-    for (let offset = 0; offset < pack.length; offset += CHUNK) {
-      out.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(offset, offset + CHUNK)])));
+  const build = (): Buffer => {
+    const { objects, shallowLines } = planFetch(repo, request);
+    const pack = writePack(repo.store, objects);
+    const out: Buffer[] = [];
+    for (const line of shallowLines) {
+      const [kind, sha] = line.split(' ');
+      out.push(pktLine(`${kind} ${sha}\n`));
     }
-  } else {
-    out.push(pack);
-  }
-  out.push(PKT_FLUSH);
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(out));
+    out.push(pktLine('NAK\n'));
+    if (sideband) {
+      const CHUNK = 32768;
+      for (let offset = 0; offset < pack.length; offset += CHUNK) {
+        out.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(offset, offset + CHUNK)])));
+      }
+    } else {
+      out.push(pack);
+    }
+    out.push(PKT_FLUSH);
+    return Buffer.concat(out);
+  };
+  const answer = request.wants.every((want) => repo.store.has(want)) ? cachedFetch(repo, fetchKey('v0', request, sideband), build) : build();
+  sendBuffer(res, 200, 'application/x-git-upload-pack-result', answer);
 }
 
 // --------------------------------------------------------------------------- receive-pack

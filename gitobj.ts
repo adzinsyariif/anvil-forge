@@ -23,6 +23,8 @@ export interface StoredObject {
 /** One repository's content-addressed object store. */
 export class ObjectStore {
   readonly objects = new Map<string, StoredObject>();
+  /** Memoized commit headers: object bytes never change, so a commit's tree and parents are fixed. */
+  readonly commitCache = new Map<string, { tree: string; parents: string[] }>();
 
   put(type: ObjType, data: Buffer): string {
     const sha = hashObject(type, data);
@@ -154,6 +156,18 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
+/** A commit's tree and parents, parsed once per store and memoized (see ObjectStore.commitCache). */
+export function commitInfo(store: ObjectStore, sha: string): { tree: string; parents: string[] } | null {
+  const cached = store.commitCache.get(sha);
+  if (cached !== undefined) return cached;
+  const object = store.get(sha);
+  if (object === undefined || object.type !== 'commit') return null;
+  const parsed = parseCommit(object.data);
+  const info = { tree: parsed.tree, parents: parsed.parents };
+  store.commitCache.set(sha, info);
+  return info;
+}
+
 export function buildCommit(info: CommitInfo): Buffer {
   const lines = [`tree ${info.tree}`];
   for (const parent of info.parents) lines.push(`parent ${parent}`);
@@ -207,9 +221,11 @@ export function collectReachable(store: ObjectStore, roots: Iterable<string>, pa
     if (object === undefined) continue;
     seen.add(sha);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      stack.push(commit.tree);
-      if (!parentless.has(sha)) for (const parent of commit.parents) stack.push(parent);
+      const commit = commitInfo(store, sha);
+      if (commit !== null) {
+        stack.push(commit.tree);
+        if (!parentless.has(sha)) for (const parent of commit.parents) stack.push(parent);
+      }
     } else if (object.type === 'tree') {
       for (const entry of parseTree(object.data)) stack.push(entry.sha);
     } else if (object.type === 'tag') {
@@ -227,16 +243,32 @@ export function commitAncestors(store: ObjectStore, tip: string): Set<string> {
   while (stack.length > 0) {
     const sha = stack.pop() as string;
     if (seen.has(sha)) continue;
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
     seen.add(sha);
-    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    for (const parent of info.parents) stack.push(parent);
   }
   return seen;
 }
 
+/**
+ * Whether `ancestor` is `tip` or one of its ancestors. Walks from the tip and stops the
+ * moment the ancestor is found: the common fast-forward case (the pushed commit's parent
+ * is the current tip) answers in one step instead of walking the whole history.
+ */
 export function isAncestor(store: ObjectStore, ancestor: string, tip: string): boolean {
-  return commitAncestors(store, tip).has(ancestor);
+  const seen = new Set<string>();
+  const stack = [tip];
+  while (stack.length > 0) {
+    const sha = stack.pop() as string;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
+    if (sha === ancestor) return true;
+    for (const parent of info.parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** A merge base of two commits (nearest common ancestor by BFS from `b`), or null. */
@@ -249,8 +281,8 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
     if (seen.has(sha)) continue;
     seen.add(sha);
     if (ancestorsOfA.has(sha)) return sha;
-    const object = store.get(sha);
-    if (object !== undefined && object.type === 'commit') queue.push(...parseCommit(object.data).parents);
+    const info = commitInfo(store, sha);
+    if (info !== null) queue.push(...info.parents);
   }
   return null;
 }
@@ -350,6 +382,7 @@ export function readPack(store: ObjectStore, pack: Buffer): number {
   const count = pack.readUInt32BE(8);
   let offset = 12;
   const byOffset = new Map<number, PackEntry>();
+  const bySha = new Map<string, PackEntry>();
   const pendingRef: { base: string; delta: Buffer; offset: number }[] = [];
 
   const readObjectHeader = (at: number): { typeCode: number; size: number; next: number } => {
@@ -383,19 +416,19 @@ export function readPack(store: ObjectStore, pack: Buffer): number {
       }
       const baseEntry = byOffset.get(start - back);
       const inflated = inflateSync(pack.subarray(offset));
-      offset += compressedLength(pack, offset);
+      offset += streamLength(pack, offset, inflated);
       if (baseEntry === undefined) throw new Error('ofs-delta base missing');
       const data = applyDelta(baseEntry.data, inflated);
       const entry: PackEntry = { type: baseEntry.type, data, offset: start };
       byOffset.set(start, entry);
-      store.put(entry.type, entry.data);
+      bySha.set(store.put(entry.type, entry.data), entry);
     } else if (typeCode === 7) {
       // REF_DELTA: the base is named by sha, in this pack or already in the store.
       const baseSha = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
       const inflated = inflateSync(pack.subarray(offset));
-      offset += compressedLength(pack, offset);
-      const baseEntry = [...byOffset.values()].find((entry) => hashObject(entry.type, entry.data) === baseSha) ?? (() => {
+      offset += streamLength(pack, offset, inflated);
+      const baseEntry = bySha.get(baseSha) ?? (() => {
         const stored = store.get(baseSha);
         return stored === undefined ? undefined : { type: stored.type, data: stored.data, offset: -1 };
       })();
@@ -406,15 +439,15 @@ export function readPack(store: ObjectStore, pack: Buffer): number {
       const data = applyDelta(baseEntry.data, inflated);
       const entry: PackEntry = { type: baseEntry.type, data, offset: start };
       byOffset.set(start, entry);
-      store.put(entry.type, entry.data);
+      bySha.set(store.put(entry.type, entry.data), entry);
     } else {
       const type = CODE_TYPES[typeCode];
       if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
       const inflated = inflateSync(pack.subarray(offset));
-      offset += compressedLength(pack, offset);
+      offset += streamLength(pack, offset, inflated);
       const entry: PackEntry = { type, data: inflated, offset: start };
       byOffset.set(start, entry);
-      store.put(entry.type, entry.data);
+      bySha.set(store.put(entry.type, entry.data), entry);
     }
   }
   for (const pending of pendingRef) {
@@ -423,6 +456,46 @@ export function readPack(store: ObjectStore, pack: Buffer): number {
     store.put(stored.type, applyDelta(stored.data, pending.delta));
   }
   return count;
+}
+
+/** The adler32 checksum zlib appends to every stream, over the inflated bytes. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i += 1) {
+      a += data[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * The compressed length of the zlib stream starting at `offset`, given its inflated bytes.
+ * The stream ends with the adler32 of the inflated data, so scan for that checksum and take
+ * the first candidate prefix that inflates to exactly `inflated` — two inflations and no
+ * thrown errors, where probing by trial inflation pays a zlib error (and its stack trace)
+ * for every wrong guess. Falls back to the probing search when no candidate verifies.
+ */
+function streamLength(pack: Buffer, offset: number, inflated: Buffer): number {
+  const adler = Buffer.alloc(4);
+  adler.writeUInt32BE(adler32(inflated), 0);
+  let idx = pack.indexOf(adler, offset + 2);
+  while (idx !== -1) {
+    const length = idx + 4 - offset;
+    try {
+      if (inflateSync(pack.subarray(offset, offset + length)).equals(inflated)) return length;
+    } catch {
+      // Not the stream's end; keep scanning.
+    }
+    idx = pack.indexOf(adler, idx + 1);
+  }
+  return compressedLength(pack, offset);
 }
 
 /** The compressed length of the zlib stream starting at `offset` (inflate and measure). */
